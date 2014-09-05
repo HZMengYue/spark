@@ -40,6 +40,21 @@ class SQLQuerySuite extends QueryTest with BeforeAndAfterAll {
     TimeZone.setDefault(origZone)
   }
 
+  test("Create table") {
+      sql("CREATE TABLE table_name (a asdf, b FLOAT, c STRING) MAPPED BY (hbase_table_name, a = k1, b = sf1.cq1, c = k2)")
+  }
+
+  test("Drop table") {
+    sql("DROP TABLE tableName")
+  }
+
+  test("Drops an existing column from the SQL table") {
+    sql("ALTER TABLE tableName DROP column")
+  }
+
+  test("Adds a new column that is mapped to existing column family 'cf' and column qualifier 'cq'") {
+    sql("ALTER TABLE tableName ADD col1 INT MAPPED BY (col1 = cf.cq)")
+  }
 
   test("SPARK-2041 column name equals tablename") {
     checkAnswer(
