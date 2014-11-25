@@ -17,10 +17,13 @@
 
 package org.apache.spark.executor
 
-import java.io.File
+import java.io.{ObjectInputStream, File}
 import java.lang.management.ManagementFactory
 import java.nio.ByteBuffer
 import java.util.concurrent._
+
+import org.apache.spark.scheduler.Task.ObjectInputStreamWithCustomClassLoader
+
 
 import scala.collection.JavaConversions._
 import scala.collection.mutable.{ArrayBuffer, HashMap}
@@ -33,7 +36,7 @@ import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.scheduler._
 import org.apache.spark.shuffle.FetchFailedException
 import org.apache.spark.storage.{StorageLevel, TaskResultBlockId}
-import org.apache.spark.util.{SparkUncaughtExceptionHandler, AkkaUtils, Utils}
+import org.apache.spark.util.{SparkUncaughtExceptionHandler, ByteBufferInputStream, AkkaUtils, Utils}
 
 /**
  * Spark executor used with Mesos, YARN, and the standalone scheduler.
@@ -52,6 +55,7 @@ private[spark] class Executor(
   // Each map holds the master's timestamp for the version of that file or JAR we got.
   private val currentFiles: HashMap[String, Long] = new HashMap[String, Long]()
   private val currentJars: HashMap[String, Long] = new HashMap[String, Long]()
+  private val currentResources: ConcurrentHashMap[String, Pair[ExtResource[_], Long]] = new ConcurrentHashMap[String, Pair[ExtResource[_], Long]]()
 
   private val EMPTY_BYTE_BUFFER = ByteBuffer.wrap(new Array[Byte](0))
 
@@ -140,6 +144,9 @@ private[spark] class Executor(
     env.actorSystem.stop(executorActor)
     isStopped = true
     threadPool.shutdown()
+    // terminate live external resources
+    currentResources.foreach(_._2._1.cleanup(slaveHostname, executorId))
+    
     if (!isLocal) {
       env.stop()
     }
@@ -173,8 +180,8 @@ private[spark] class Executor(
 
       try {
         Accumulators.clear()
-        val (taskFiles, taskJars, taskBytes) = Task.deserializeWithDependencies(serializedTask)
-        updateDependencies(taskFiles, taskJars)
+        val (taskFiles, taskJars, in, dataIn) = Task.deserializeWithDependencies(serializedTask)
+        val taskBytes = updateDependencies(taskFiles, taskJars, serializedTask,  in, dataIn)
         task = ser.deserialize[Task[Any]](taskBytes, Thread.currentThread.getContextClassLoader)
 
         // If this task has been killed before we deserialized it, let's quit now. Otherwise,
@@ -190,6 +197,10 @@ private[spark] class Executor(
         attemptedTask = Some(task)
         logDebug("Task " + taskId + "'s epoch is " + task.epoch)
         env.mapOutputTracker.updateEpoch(task.epoch)
+        task.resources = Some(currentResources)
+        task.executorId = Some(executorId)
+        task.slaveHostname = Some(slaveHostname)
+
 
         // Run the actual task and measure its runtime.
         taskStart = System.currentTimeMillis()
@@ -221,7 +232,7 @@ private[spark] class Executor(
 
         // directSend = sending directly back to the driver
         val serializedResult = {
-          if (maxResultSize > 0 && resultSize > maxResultSize) {
+          if (resultSize > maxResultSize) {
             logWarning(s"Finished $taskName (TID $taskId). Result is larger than maxResultSize " +
               s"(${Utils.bytesToString(resultSize)} > ${Utils.bytesToString(maxResultSize)}), " +
               s"dropping it.")
@@ -274,6 +285,8 @@ private[spark] class Executor(
           }
         }
       } finally {
+        // Release all external resources used
+        ExternalResourceManager.cleanupResourcesPerTask(taskId)
         // Release memory used by this thread for shuffles
         env.shuffleMemoryManager.releaseMemoryForThisThread()
         // Release memory used by this thread for unrolling blocks
@@ -333,7 +346,10 @@ private[spark] class Executor(
    * Download any missing dependencies if we receive a new set of files and JARs from the
    * SparkContext. Also adds any new JARs we fetched to the class loader.
    */
-  private def updateDependencies(newFiles: HashMap[String, Long], newJars: HashMap[String, Long]) {
+  private def updateDependencies(newFiles: HashMap[String, Long], newJars: HashMap[String, Long],
+      serializedTask: ByteBuffer,
+      in: ByteBufferInputStream,
+      dataIn: ObjectInputStreamWithCustomClassLoader): ByteBuffer = {
     val hadoopConf = SparkHadoopUtil.get.newConfiguration(conf)
     synchronized {
       // Fetch missing dependencies
@@ -358,6 +374,16 @@ private[spark] class Executor(
           urlClassLoader.addURL(url)
         }
       }
+
+      val (extRsc, taskByte) = Task.deserializeExtResourceWithDependencies(serializedTask, in, dataIn)
+
+      for ((resource, timestamp) <- extRsc) {
+        if (currentResources.getOrElse(resource.name, (null, -1L))._2 < timestamp){
+          logInfo("Initializing " + resource.name + " with timestamp " + timestamp)
+          currentResources(resource.name) = (resource, timestamp)
+        }
+      }
+      taskByte
     }
   }
 
